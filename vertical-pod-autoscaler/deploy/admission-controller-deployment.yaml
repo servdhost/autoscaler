@@ -15,14 +15,11 @@ spec:
         app: vpa-admission-controller
     spec:
       serviceAccountName: vpa-admission-controller
-<<<<<<< HEAD
       nodeSelector:
         doks.digitalocean.com/node-pool: system-pool
-=======
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534 # nobody
->>>>>>> 465d02a28725b4aec45dc4b137fa2ca3a69557f9
       containers:
         - name: admission-controller
           image: us.gcr.io/k8s-artifacts-prod/autoscaling/vpa-admission-controller:0.8.0
