@@ -23,7 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -33,9 +33,9 @@ func checkNodesSimilar(t *testing.T, n1, n2 *apiv1.Node, comparator NodeInfoComp
 }
 
 func checkNodesSimilarWithPods(t *testing.T, n1, n2 *apiv1.Node, pods1, pods2 []*apiv1.Pod, comparator NodeInfoComparator, shouldEqual bool) {
-	ni1 := schedulernodeinfo.NewNodeInfo(pods1...)
+	ni1 := schedulerframework.NewNodeInfo(pods1...)
 	ni1.SetNode(n1)
-	ni2 := schedulernodeinfo.NewNodeInfo(pods2...)
+	ni2 := schedulerframework.NewNodeInfo(pods2...)
 	ni2.SetNode(n2)
 	assert.Equal(t, shouldEqual, comparator(ni1, ni2))
 }
@@ -101,16 +101,60 @@ func TestNodesSimilarVariousRequirementsAndPods(t *testing.T) {
 
 func TestNodesSimilarVariousMemoryRequirements(t *testing.T) {
 	comparator := CreateGenericNodeInfoComparator([]string{})
-	n1 := BuildTestNode("node1", 1000, MaxMemoryDifferenceInKiloBytes)
+	n1 := BuildTestNode("node1", 1000, 1000)
 
 	// Different memory capacity within tolerance
-	n2 := BuildTestNode("node2", 1000, MaxMemoryDifferenceInKiloBytes)
-	n2.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(2*MaxMemoryDifferenceInKiloBytes, resource.DecimalSI)
+	n2 := BuildTestNode("node2", 1000, 1000)
+	n2.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(1000-(1000*MaxCapacityMemoryDifferenceRatio)+1, resource.DecimalSI)
 	checkNodesSimilar(t, n1, n2, comparator, true)
 
 	// Different memory capacity exceeds tolerance
-	n3 := BuildTestNode("node3", 1000, MaxMemoryDifferenceInKiloBytes)
-	n3.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(2*MaxMemoryDifferenceInKiloBytes+1, resource.DecimalSI)
+	n3 := BuildTestNode("node3", 1000, 1000)
+	n3.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(1000-(1000*MaxCapacityMemoryDifferenceRatio)-1, resource.DecimalSI)
+	checkNodesSimilar(t, n1, n3, comparator, false)
+}
+
+func TestNodesSimilarVariousLargeMemoryRequirementsM5XLarge(t *testing.T) {
+	comparator := CreateGenericNodeInfoComparator([]string{})
+
+	// Use realistic memory capacity (taken from real nodes)
+	// 15944120 KB ~= 16GiB (m5.xLarge)
+	q1 := resource.MustParse("16116152Ki")
+	q2 := resource.MustParse("15944120Ki")
+
+	n1 := BuildTestNode("node1", 1000, q1.Value())
+
+	// Different memory capacity within tolerance
+	// Value taken from another m5.xLarge in a different zone
+	n2 := BuildTestNode("node2", 1000, q2.Value())
+	checkNodesSimilar(t, n1, n2, comparator, true)
+
+	// Different memory capacity exceeds tolerance
+	// Value of q1 * 1.02
+	q3 := resource.MustParse("16438475Ki")
+	n3 := BuildTestNode("node3", 1000, q3.Value())
+	checkNodesSimilar(t, n1, n3, comparator, false)
+}
+
+func TestNodesSimilarVariousLargeMemoryRequirementsM516XLarge(t *testing.T) {
+	comparator := CreateGenericNodeInfoComparator([]string{})
+
+	// Use realistic memory capacity (taken from real nodes)
+	// 257217528 KB ~= 256GiB (m5.16xLarge)
+	q1 := resource.MustParse("259970052Ki")
+	q2 := resource.MustParse("257217528Ki")
+
+	n1 := BuildTestNode("node1", 1000, q1.Value())
+
+	// Different memory capacity within tolerance
+	// Value taken from another m5.xLarge in a different zone
+	n2 := BuildTestNode("node2", 1000, q2.Value())
+	checkNodesSimilar(t, n1, n2, comparator, true)
+
+	// Different memory capacity exceeds tolerance
+	// Value of q1 * 1.02
+	q3 := resource.MustParse("265169453Ki")
+	n3 := BuildTestNode("node3", 1000, q3.Value())
 	checkNodesSimilar(t, n1, n3, comparator, false)
 }
 

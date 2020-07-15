@@ -43,6 +43,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
 	ca_processors "k8s.io/autoscaler/cluster-autoscaler/processors"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupset"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/units"
@@ -54,9 +55,9 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	kube_flag "k8s.io/component-base/cli/flag"
 	componentbaseconfig "k8s.io/component-base/config"
+	"k8s.io/component-base/config/options"
 	"k8s.io/component-base/metrics/legacyregistry"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/client/leaderelectionconfig"
+	klog "k8s.io/klog/v2"
 )
 
 // MultiStringFlag is a flag for passing multiple parameters using same flag
@@ -293,6 +294,7 @@ func buildAutoscaler() (core.Autoscaler, error) {
 
 	opts := core.AutoscalerOptions{
 		AutoscalingOptions: autoscalingOptions,
+		ClusterSnapshot:    simulator.NewDeltaClusterSnapshot(),
 		KubeClient:         kubeClient,
 		EventsKubeClient:   eventsKubeClient,
 	}
@@ -365,7 +367,7 @@ func main() {
 	leaderElection := defaultLeaderElectionConfiguration()
 	leaderElection.LeaderElect = true
 
-	leaderelectionconfig.BindFlags(&leaderElection, pflag.CommandLine)
+	options.BindLeaderElectionFlags(&leaderElection, pflag.CommandLine)
 	kube_flag.InitFlags()
 	healthCheck := metrics.NewHealthCheck(*maxInactivityTimeFlag, *maxFailingTimeFlag)
 

@@ -21,7 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 )
 
 const (
@@ -59,7 +59,11 @@ func (ng *nodegroup) MaxSize() int {
 // (new nodes finish startup and registration or removed nodes are
 // deleted completely). Implementation required.
 func (ng *nodegroup) TargetSize() (int, error) {
-	return int(ng.scalableResource.Replicas()), nil
+	size, err := ng.scalableResource.Replicas()
+	if err != nil {
+		return 0, err
+	}
+	return int(size), nil
 }
 
 // IncreaseSize increases the size of the node group. To delete a node
@@ -70,11 +74,17 @@ func (ng *nodegroup) IncreaseSize(delta int) error {
 	if delta <= 0 {
 		return fmt.Errorf("size increase must be positive")
 	}
-	size := int(ng.scalableResource.Replicas())
-	if size+delta > ng.MaxSize() {
-		return fmt.Errorf("size increase too large - desired:%d max:%d", size+delta, ng.MaxSize())
+
+	size, err := ng.scalableResource.Replicas()
+	if err != nil {
+		return err
 	}
-	return ng.scalableResource.SetSize(int32(size + delta))
+	intSize := int(size)
+
+	if intSize+delta > ng.MaxSize() {
+		return fmt.Errorf("size increase too large - desired:%d max:%d", intSize+delta, ng.MaxSize())
+	}
+	return ng.scalableResource.SetSize(int32(intSize + delta))
 }
 
 // DeleteNodes deletes nodes from this node group. Error is returned
@@ -82,6 +92,19 @@ func (ng *nodegroup) IncreaseSize(delta int) error {
 // group. This function should wait until node group size is updated.
 // Implementation required.
 func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
+	ng.machineController.accessLock.Lock()
+	defer ng.machineController.accessLock.Unlock()
+
+	replicas, err := ng.scalableResource.Replicas()
+	if err != nil {
+		return err
+	}
+
+	// if we are at minSize already we wail early.
+	if int(replicas) <= ng.MinSize() {
+		return fmt.Errorf("min size reached, nodes will not be deleted")
+	}
+
 	// Step 1: Verify all nodes belong to this node group.
 	for _, node := range nodes {
 		actualNodeGroup, err := ng.machineController.nodeGroupForNode(node)
@@ -99,12 +122,10 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 	}
 
 	// Step 2: if deleting len(nodes) would make the replica count
-	// <= 0, then the request to delete that many nodes is bogus
+	// < minSize, then the request to delete that many nodes is bogus
 	// and we fail fast.
-	replicas := ng.scalableResource.Replicas()
-
-	if replicas-int32(len(nodes)) <= 0 {
-		return fmt.Errorf("unable to delete %d machines in %q, machine replicas are <= 0 ", len(nodes), ng.Id())
+	if replicas-int32(len(nodes)) < int32(ng.MinSize()) {
+		return fmt.Errorf("unable to delete %d machines in %q, machine replicas are %q, minSize is %q ", len(nodes), ng.Id(), replicas, ng.MinSize())
 	}
 
 	// Step 3: annotate the corresponding machine that it is a
@@ -139,6 +160,7 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 		}
 
 		if err := ng.scalableResource.SetSize(replicas - 1); err != nil {
+			nodeGroup.scalableResource.UnmarkMachineForDeletion(machine)
 			return err
 		}
 
@@ -184,7 +206,11 @@ func (ng *nodegroup) Id() string {
 
 // Debug returns a string containing all information regarding this node group.
 func (ng *nodegroup) Debug() string {
-	return fmt.Sprintf(debugFormat, ng.Id(), ng.MinSize(), ng.MaxSize(), ng.scalableResource.Replicas())
+	replicas, err := ng.scalableResource.Replicas()
+	if err != nil {
+		return fmt.Sprintf("%s (min: %d, max: %d, replicas: %v)", ng.Id(), ng.MinSize(), ng.MaxSize(), err)
+	}
+	return fmt.Sprintf(debugFormat, ng.Id(), ng.MinSize(), ng.MaxSize(), replicas)
 }
 
 // Nodes returns a list of all nodes that belong to this node group.
@@ -195,10 +221,14 @@ func (ng *nodegroup) Nodes() ([]cloudprovider.Instance, error) {
 		return nil, err
 	}
 
+	// Nodes do not have normalized IDs, so do not normalize the ID here.
+	// The IDs returned here are used to check if a node is registered or not and
+	// must match the ID on the Node object itself.
+	// https://github.com/kubernetes/autoscaler/blob/a973259f1852303ba38a3a61eeee8489cf4e1b13/cluster-autoscaler/clusterstate/clusterstate.go#L967-L985
 	instances := make([]cloudprovider.Instance, len(nodes))
 	for i := range nodes {
 		instances[i] = cloudprovider.Instance{
-			Id: string(normalizedProviderString(nodes[i])),
+			Id: nodes[i],
 		}
 	}
 
@@ -213,7 +243,7 @@ func (ng *nodegroup) Nodes() ([]cloudprovider.Instance, error) {
 // allocatable information as well as all pods that are started on the
 // node by default, using manifest (most likely only kube-proxy).
 // Implementation optional.
-func (ng *nodegroup) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
+func (ng *nodegroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 

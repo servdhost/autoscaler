@@ -29,7 +29,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -173,7 +173,7 @@ func ValidatePodSpecificAnnotationUpdates(newPod, oldPod *core.Pod, fldPath *fie
 		if newVal, exists := newAnnotations[k]; exists && newVal == oldVal {
 			continue // No change.
 		}
-		if strings.HasPrefix(k, apparmor.ContainerAnnotationKeyPrefix) {
+		if strings.HasPrefix(k, v1.AppArmorBetaContainerAnnotationKeyPrefix) {
 			allErrs = append(allErrs, field.Forbidden(fldPath.Key(k), "may not remove or update AppArmor annotations"))
 		}
 		if k == core.MirrorPodAnnotationKey {
@@ -185,7 +185,7 @@ func ValidatePodSpecificAnnotationUpdates(newPod, oldPod *core.Pod, fldPath *fie
 		if _, ok := oldAnnotations[k]; ok {
 			continue // No change.
 		}
-		if strings.HasPrefix(k, apparmor.ContainerAnnotationKeyPrefix) {
+		if strings.HasPrefix(k, v1.AppArmorBetaContainerAnnotationKeyPrefix) {
 			allErrs = append(allErrs, field.Forbidden(fldPath.Key(k), "may not add AppArmor annotations"))
 		}
 		if k == core.MirrorPodAnnotationKey {
@@ -1857,7 +1857,8 @@ func ValidatePersistentVolumeUpdate(newPv, oldPv *core.PersistentVolume) field.E
 
 	// PersistentVolumeSource should be immutable after creation.
 	if !apiequality.Semantic.DeepEqual(newPv.Spec.PersistentVolumeSource, oldPv.Spec.PersistentVolumeSource) {
-		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec", "persistentvolumesource"), "is immutable after creation"))
+		pvcSourceDiff := diff.ObjectDiff(newPv.Spec.PersistentVolumeSource, oldPv.Spec.PersistentVolumeSource)
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec", "persistentvolumesource"), fmt.Sprintf("spec.persistentvolumesource is immutable after creation\n%v", pvcSourceDiff)))
 	}
 	allErrs = append(allErrs, ValidateImmutableField(newPv.Spec.VolumeMode, oldPv.Spec.VolumeMode, field.NewPath("volumeMode"))...)
 
@@ -1972,7 +1973,8 @@ func ValidatePersistentVolumeClaimUpdate(newPvc, oldPvc *core.PersistentVolumeCl
 		newSize := newPvc.Spec.Resources.Requests["storage"]
 
 		if !apiequality.Semantic.DeepEqual(newPvcClone.Spec, oldPvcClone.Spec) {
-			allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "is immutable after creation except resources.requests for bound claims"))
+			specDiff := diff.ObjectDiff(newPvcClone.Spec, oldPvcClone.Spec)
+			allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), fmt.Sprintf("spec is immutable after creation except resources.requests for bound claims\n%v", specDiff)))
 		}
 		if newSize.Cmp(oldSize) < 0 {
 			allErrs = append(allErrs, field.Forbidden(field.NewPath("spec", "resources", "requests", "storage"), "field can not be less than previous value"))
@@ -1982,7 +1984,8 @@ func ValidatePersistentVolumeClaimUpdate(newPvc, oldPvc *core.PersistentVolumeCl
 		// changes to Spec are not allowed, but updates to label/and some annotations are OK.
 		// no-op updates pass validation.
 		if !apiequality.Semantic.DeepEqual(newPvcClone.Spec, oldPvcClone.Spec) {
-			allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "field is immutable after creation"))
+			specDiff := diff.ObjectDiff(newPvcClone.Spec, oldPvcClone.Spec)
+			allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), fmt.Sprintf("field is immutable after creation\n%v", specDiff)))
 		}
 	}
 
@@ -3110,8 +3113,9 @@ func ValidatePodSingleHugePageResources(pod *core.Pod, specPath *field.Path) fie
 	return allErrs
 }
 
-// ValidatePod tests if required fields in the pod are set.
-func ValidatePod(pod *core.Pod, opts PodValidationOptions) field.ErrorList {
+// validatePodMetadataAndSpec tests if required fields in the pod.metadata and pod.spec are set,
+// and is called by ValidatePodCreate and ValidatePodUpdate.
+func validatePodMetadataAndSpec(pod *core.Pod, opts PodValidationOptions) field.ErrorList {
 	fldPath := field.NewPath("metadata")
 	allErrs := ValidateObjectMeta(&pod.ObjectMeta, true, ValidatePodName, fldPath)
 	allErrs = append(allErrs, ValidatePodSpecificAnnotations(pod.ObjectMeta.Annotations, &pod.Spec, fldPath.Child("annotations"))...)
@@ -3141,6 +3145,13 @@ func ValidatePod(pod *core.Pod, opts PodValidationOptions) field.ErrorList {
 	if !opts.AllowMultipleHugePageResources {
 		allErrs = append(allErrs, ValidatePodSingleHugePageResources(pod, specPath)...)
 	}
+
+	return allErrs
+}
+
+// validatePodIPs validates IPs in pod status
+func validatePodIPs(pod *core.Pod) field.ErrorList {
+	allErrs := field.ErrorList{}
 
 	podIPsField := field.NewPath("status", "podIPs")
 
@@ -3569,10 +3580,10 @@ func ValidateSeccompPodAnnotations(annotations map[string]string, fldPath *field
 func ValidateAppArmorPodAnnotations(annotations map[string]string, spec *core.PodSpec, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	for k, p := range annotations {
-		if !strings.HasPrefix(k, apparmor.ContainerAnnotationKeyPrefix) {
+		if !strings.HasPrefix(k, v1.AppArmorBetaContainerAnnotationKeyPrefix) {
 			continue
 		}
-		containerName := strings.TrimPrefix(k, apparmor.ContainerAnnotationKeyPrefix)
+		containerName := strings.TrimPrefix(k, v1.AppArmorBetaContainerAnnotationKeyPrefix)
 		if !podSpecHasContainer(spec, containerName) {
 			allErrs = append(allErrs, field.Invalid(fldPath.Key(k), containerName, "container not found"))
 		}
@@ -3702,7 +3713,7 @@ func ValidateContainerUpdates(newContainers, oldContainers []core.Container, fld
 
 // ValidatePodCreate validates a pod in the context of its initial create
 func ValidatePodCreate(pod *core.Pod, opts PodValidationOptions) field.ErrorList {
-	allErrs := ValidatePod(pod, opts)
+	allErrs := validatePodMetadataAndSpec(pod, opts)
 
 	fldPath := field.NewPath("spec")
 	// EphemeralContainers can only be set on update using the ephemeralcontainers subresource
@@ -3718,6 +3729,7 @@ func ValidatePodCreate(pod *core.Pod, opts PodValidationOptions) field.ErrorList
 func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) field.ErrorList {
 	fldPath := field.NewPath("metadata")
 	allErrs := ValidateObjectMetaUpdate(&newPod.ObjectMeta, &oldPod.ObjectMeta, fldPath)
+	allErrs = append(allErrs, validatePodMetadataAndSpec(newPod, opts)...)
 	allErrs = append(allErrs, ValidatePodSpecificAnnotationUpdates(newPod, oldPod, fldPath.Child("annotations"))...)
 	specPath := field.NewPath("spec")
 
@@ -3847,6 +3859,14 @@ func ValidatePodStatusUpdate(newPod, oldPod *core.Pod) field.ErrorList {
 	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), oldPod.Spec.RestartPolicy)...)
 	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.InitContainerStatuses, oldPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"), oldPod.Spec.RestartPolicy)...)
 
+	if newIPErrs := validatePodIPs(newPod); len(newIPErrs) > 0 {
+		// Tolerate IP errors if IP errors already existed in the old pod. See http://issue.k8s.io/90625
+		// TODO(liggitt): Drop the check of oldPod in 1.20
+		if oldIPErrs := validatePodIPs(oldPod); len(oldIPErrs) == 0 {
+			allErrs = append(allErrs, newIPErrs...)
+		}
+	}
+
 	// For status update we ignore changes to pod spec.
 	newPod.Spec = oldPod.Spec
 
@@ -3931,7 +3951,6 @@ func ValidatePodTemplateUpdate(newPod, oldPod *core.PodTemplate) field.ErrorList
 var supportedSessionAffinityType = sets.NewString(string(core.ServiceAffinityClientIP), string(core.ServiceAffinityNone))
 var supportedServiceType = sets.NewString(string(core.ServiceTypeClusterIP), string(core.ServiceTypeNodePort),
 	string(core.ServiceTypeLoadBalancer), string(core.ServiceTypeExternalName))
-var supportedServiceIPFamily = sets.NewString(string(core.IPv4Protocol), string(core.IPv6Protocol))
 
 // ValidateService tests if required fields/annotations of a Service are valid.
 func ValidateService(service *core.Service, allowAppProtocol bool) field.ErrorList {
@@ -4132,21 +4151,6 @@ func ValidateService(service *core.Service, allowAppProtocol bool) field.ErrorLi
 		}
 	}
 
-	//if an ipfamily provided then it has to be one of the supported values
-	// note:
-	// - we don't validate service.Spec.IPFamily is supported by the cluster
-	// - we don't validate service.Spec.ClusterIP is within a range supported by the cluster
-	// both of these validations are done by the ipallocator
-
-	// if the gate is on this field is required (and defaulted by REST if not provided by user)
-	if utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) && service.Spec.IPFamily == nil {
-		allErrs = append(allErrs, field.Required(specPath.Child("ipFamily"), ""))
-	}
-
-	if service.Spec.IPFamily != nil && !supportedServiceIPFamily.Has(string(*service.Spec.IPFamily)) {
-		allErrs = append(allErrs, field.NotSupported(specPath.Child("ipFamily"), service.Spec.IPFamily, supportedServiceIPFamily.List()))
-	}
-
 	allErrs = append(allErrs, validateServiceExternalTrafficFieldsValue(service)...)
 	return allErrs
 }
@@ -4255,18 +4259,11 @@ func ValidateServiceCreate(service *core.Service) field.ErrorList {
 func ValidateServiceUpdate(service, oldService *core.Service) field.ErrorList {
 	allErrs := ValidateObjectMetaUpdate(&service.ObjectMeta, &oldService.ObjectMeta, field.NewPath("metadata"))
 
-	// ClusterIP and IPFamily should be immutable for services using it (every type other than ExternalName)
+	// ClusterIP should be immutable for services using it (every type other than ExternalName)
 	// which do not have ClusterIP assigned yet (empty string value)
 	if service.Spec.Type != core.ServiceTypeExternalName {
 		if oldService.Spec.Type != core.ServiceTypeExternalName && oldService.Spec.ClusterIP != "" {
 			allErrs = append(allErrs, ValidateImmutableField(service.Spec.ClusterIP, oldService.Spec.ClusterIP, field.NewPath("spec", "clusterIP"))...)
-		}
-		// notes:
-		// we drop the IPFamily field when the Dualstack gate is off.
-		// once the gate is on, we start assigning default ipfamily according to cluster settings. in other words
-		// though the field is immutable, we allow (onetime) change from nil==> to value
-		if oldService.Spec.IPFamily != nil {
-			allErrs = append(allErrs, ValidateImmutableField(service.Spec.IPFamily, oldService.Spec.IPFamily, field.NewPath("spec", "ipFamily"))...)
 		}
 	}
 
@@ -4479,15 +4476,8 @@ func ValidateNodeSpecificAnnotations(annotations map[string]string, fldPath *fie
 	return allErrs
 }
 
-// NodeValidationOptions contains the different settings for node validation
-type NodeValidationOptions struct {
-	// Should node a spec containing more than one huge page resource (with different sizes)
-	// with pre-allocated memory trigger validation errors
-	ValidateSingleHugePageResource bool
-}
-
 // ValidateNode tests if required fields in the node are set.
-func ValidateNode(node *core.Node, opts NodeValidationOptions) field.ErrorList {
+func ValidateNode(node *core.Node) field.ErrorList {
 	fldPath := field.NewPath("metadata")
 	allErrs := ValidateObjectMeta(&node.ObjectMeta, false, ValidateNodeName, fldPath)
 	allErrs = append(allErrs, ValidateNodeSpecificAnnotations(node.ObjectMeta.Annotations, fldPath.Child("annotations"))...)
@@ -4498,7 +4488,7 @@ func ValidateNode(node *core.Node, opts NodeValidationOptions) field.ErrorList {
 	// Only validate spec.
 	// All status fields are optional and can be updated later.
 	// That said, if specified, we need to ensure they are valid.
-	allErrs = append(allErrs, ValidateNodeResources(node, opts)...)
+	allErrs = append(allErrs, ValidateNodeResources(node)...)
 
 	// validate PodCIDRS only if we need to
 	if len(node.Spec.PodCIDRs) > 0 {
@@ -4538,11 +4528,8 @@ func ValidateNode(node *core.Node, opts NodeValidationOptions) field.ErrorList {
 }
 
 // ValidateNodeResources is used to make sure a node has valid capacity and allocatable values.
-func ValidateNodeResources(node *core.Node, opts NodeValidationOptions) field.ErrorList {
+func ValidateNodeResources(node *core.Node) field.ErrorList {
 	allErrs := field.ErrorList{}
-	if opts.ValidateSingleHugePageResource {
-		allErrs = append(allErrs, ValidateNodeSingleHugePageResources(node)...)
-	}
 
 	// Validate resource quantities in capacity.
 	for k, v := range node.Status.Capacity {
@@ -4554,42 +4541,12 @@ func ValidateNodeResources(node *core.Node, opts NodeValidationOptions) field.Er
 	for k, v := range node.Status.Allocatable {
 		resPath := field.NewPath("status", "allocatable", string(k))
 		allErrs = append(allErrs, ValidateResourceQuantityValue(string(k), v, resPath)...)
-	}
-	return allErrs
-}
-
-// ValidateNodeHugePageResources is used to make sure a node has valid capacity and allocatable values for the huge page resources.
-func ValidateNodeSingleHugePageResources(node *core.Node) field.ErrorList {
-	allErrs := field.ErrorList{}
-	// Validate resource quantities in capacity.
-	hugePageSizes := sets.NewString()
-	for k, v := range node.Status.Capacity {
-		resPath := field.NewPath("status", "capacity", string(k))
-		// track any huge page size that has a positive value
-		if helper.IsHugePageResourceName(k) && v.Value() > int64(0) {
-			hugePageSizes.Insert(string(k))
-		}
-		if len(hugePageSizes) > 1 {
-			allErrs = append(allErrs, field.Invalid(resPath, v, "may not have pre-allocated hugepages for multiple page sizes"))
-		}
-	}
-	// Validate resource quantities in allocatable.
-	hugePageSizes = sets.NewString()
-	for k, v := range node.Status.Allocatable {
-		resPath := field.NewPath("status", "allocatable", string(k))
-		// track any huge page size that has a positive value
-		if helper.IsHugePageResourceName(k) && v.Value() > int64(0) {
-			hugePageSizes.Insert(string(k))
-		}
-		if len(hugePageSizes) > 1 {
-			allErrs = append(allErrs, field.Invalid(resPath, v, "may not have pre-allocated hugepages for multiple page sizes"))
-		}
 	}
 	return allErrs
 }
 
 // ValidateNodeUpdate tests to make sure a node update can be applied.  Modifies oldNode.
-func ValidateNodeUpdate(node, oldNode *core.Node, opts NodeValidationOptions) field.ErrorList {
+func ValidateNodeUpdate(node, oldNode *core.Node) field.ErrorList {
 	fldPath := field.NewPath("metadata")
 	allErrs := ValidateObjectMetaUpdate(&node.ObjectMeta, &oldNode.ObjectMeta, fldPath)
 	allErrs = append(allErrs, ValidateNodeSpecificAnnotations(node.ObjectMeta.Annotations, fldPath.Child("annotations"))...)
@@ -4600,7 +4557,7 @@ func ValidateNodeUpdate(node, oldNode *core.Node, opts NodeValidationOptions) fi
 	// 	allErrs = append(allErrs, field.Invalid("status", node.Status, "must be empty"))
 	// }
 
-	allErrs = append(allErrs, ValidateNodeResources(node, opts)...)
+	allErrs = append(allErrs, ValidateNodeResources(node)...)
 
 	// Validate no duplicate addresses in node status.
 	addresses := make(map[core.NodeAddress]bool)
