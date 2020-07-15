@@ -34,9 +34,9 @@ import (
 )
 
 const (
-	minimalCPULowerBound    = "20m"
+	minimalCPULowerBound    = "0m"
 	minimalCPUUpperBound    = "100m"
-	minimalMemoryLowerBound = "20Mi"
+	minimalMemoryLowerBound = "0Mi"
 	minimalMemoryUpperBound = "300Mi"
 	// the initial values should be outside minimal bounds
 	initialCPU     = int64(10) // mCPU
@@ -101,7 +101,7 @@ var _ = FullVpaE2eDescribe("Pods under VPA", func() {
 		rc.ConsumeCPU(600 * replicas)
 		err = waitForResourceRequestInRangeInPods(
 			f, pollTimeout, metav1.ListOptions{LabelSelector: "name=hamster"}, apiv1.ResourceCPU,
-			ParseQuantityOrDie("500m"), ParseQuantityOrDie("900m"))
+			ParseQuantityOrDie("500m"), ParseQuantityOrDie("1000m"))
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	})
 

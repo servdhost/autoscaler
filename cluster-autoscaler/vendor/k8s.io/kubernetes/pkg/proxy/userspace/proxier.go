@@ -33,7 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/proxy"
 	"k8s.io/kubernetes/pkg/proxy/config"
 	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
@@ -346,7 +346,7 @@ func (proxier *Proxier) Sync() {
 func (proxier *Proxier) syncProxyRules() {
 	start := time.Now()
 	defer func() {
-		klog.V(2).Infof("userspace syncProxyRules took %v", time.Since(start))
+		klog.V(4).Infof("userspace syncProxyRules took %v", time.Since(start))
 	}()
 
 	// don't sync rules till we've received services and endpoints
@@ -367,7 +367,7 @@ func (proxier *Proxier) syncProxyRules() {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 
-	klog.V(2).Infof("userspace proxy: processing %d service events", len(changes))
+	klog.V(4).Infof("userspace proxy: processing %d service events", len(changes))
 	for _, change := range changes {
 		existingPorts := proxier.mergeService(change.current)
 		proxier.unmergeService(change.previous, existingPorts)
@@ -489,12 +489,11 @@ func (proxier *Proxier) mergeService(service *v1.Service) sets.String {
 	if service == nil {
 		return nil
 	}
-	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
-	if utilproxy.ShouldSkipService(svcName, service) {
-		klog.V(3).Infof("Skipping service %s due to clusterIP = %q", svcName, service.Spec.ClusterIP)
+	if utilproxy.ShouldSkipService(service) {
 		return nil
 	}
 	existingPorts := sets.NewString()
+	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
 		serviceName := proxy.ServicePortName{NamespacedName: svcName, Port: servicePort.Name}
@@ -551,12 +550,12 @@ func (proxier *Proxier) unmergeService(service *v1.Service, existingPorts sets.S
 	if service == nil {
 		return
 	}
-	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
-	if utilproxy.ShouldSkipService(svcName, service) {
-		klog.V(3).Infof("Skipping service %s due to clusterIP = %q", svcName, service.Spec.ClusterIP)
+
+	if utilproxy.ShouldSkipService(service) {
 		return
 	}
 	staleUDPServices := sets.NewString()
+	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
 		if existingPorts.Has(servicePort.Name) {

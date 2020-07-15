@@ -58,6 +58,11 @@ const (
 	SupportedCheckpointVersion = "v3"
 )
 
+var (
+	// DefaultControlledResources is a default value of Spec.ResourcePolicy.ContainerPolicies[].ControlledResources.
+	DefaultControlledResources = []ResourceName{ResourceCPU, ResourceMemory}
+)
+
 // ContainerStateAggregator is an interface for objects that consume and
 // aggregate container usage samples.
 type ContainerStateAggregator interface {
@@ -100,10 +105,11 @@ type AggregateContainerState struct {
 	// we want to know if it needs recommendation, if the recommendation
 	// is present and if the automatic updates are on (are we able to
 	// apply the recommendation to the pods).
-	LastRecommendation corev1.ResourceList
-	IsUnderVPA         bool
-	UpdateMode         *vpa_types.UpdateMode
-	ScalingMode        *vpa_types.ContainerScalingMode
+	LastRecommendation  corev1.ResourceList
+	IsUnderVPA          bool
+	UpdateMode          *vpa_types.UpdateMode
+	ScalingMode         *vpa_types.ContainerScalingMode
+	ControlledResources *[]ResourceName
 }
 
 // GetLastRecommendation returns last recorded recommendation.
@@ -128,6 +134,15 @@ func (a *AggregateContainerState) GetScalingMode() *vpa_types.ContainerScalingMo
 	return a.ScalingMode
 }
 
+// GetControlledResources returns the list of resources controlled by VPA controlling this aggregator.
+// Returns default if not set.
+func (a *AggregateContainerState) GetControlledResources() []ResourceName {
+	if a.ControlledResources != nil {
+		return *a.ControlledResources
+	}
+	return DefaultControlledResources
+}
+
 // MarkNotAutoscaled registers that this container state is not controlled by
 // a VPA object.
 func (a *AggregateContainerState) MarkNotAutoscaled() {
@@ -135,6 +150,7 @@ func (a *AggregateContainerState) MarkNotAutoscaled() {
 	a.LastRecommendation = nil
 	a.UpdateMode = nil
 	a.ScalingMode = nil
+	a.ControlledResources = nil
 }
 
 // MergeContainerState merges two AggregateContainerStates.
@@ -142,7 +158,8 @@ func (a *AggregateContainerState) MergeContainerState(other *AggregateContainerS
 	a.AggregateCPUUsage.Merge(other.AggregateCPUUsage)
 	a.AggregateMemoryPeaks.Merge(other.AggregateMemoryPeaks)
 
-	if !other.FirstSampleStart.IsZero() && other.FirstSampleStart.Before(a.FirstSampleStart) {
+	if a.FirstSampleStart.IsZero() ||
+		(!other.FirstSampleStart.IsZero() && other.FirstSampleStart.Before(a.FirstSampleStart)) {
 		a.FirstSampleStart = other.FirstSampleStart
 	}
 	if other.LastSampleStart.After(a.LastSampleStart) {
@@ -153,9 +170,10 @@ func (a *AggregateContainerState) MergeContainerState(other *AggregateContainerS
 
 // NewAggregateContainerState returns a new, empty AggregateContainerState.
 func NewAggregateContainerState() *AggregateContainerState {
+	config := GetAggregationsConfig()
 	return &AggregateContainerState{
-		AggregateCPUUsage:    util.NewDecayingHistogram(CPUHistogramOptions, CPUHistogramDecayHalfLife),
-		AggregateMemoryPeaks: util.NewDecayingHistogram(MemoryHistogramOptions, MemoryHistogramDecayHalfLife),
+		AggregateCPUUsage:    util.NewDecayingHistogram(config.CPUHistogramOptions, config.CPUHistogramDecayHalfLife),
+		AggregateMemoryPeaks: util.NewDecayingHistogram(config.MemoryHistogramOptions, config.MemoryHistogramDecayHalfLife),
 		CreationTime:         time.Now(),
 	}
 }
@@ -246,16 +264,16 @@ func (a *AggregateContainerState) LoadFromCheckpoint(checkpoint *vpa_types.Verti
 
 func (a *AggregateContainerState) isExpired(now time.Time) bool {
 	if a.isEmpty() {
-		return now.Sub(a.CreationTime) >= MemoryAggregationWindowLength
+		return now.Sub(a.CreationTime) >= GetAggregationsConfig().GetMemoryAggregationWindowLength()
 	}
-	return now.Sub(a.LastSampleStart) >= MemoryAggregationWindowLength
+	return now.Sub(a.LastSampleStart) >= GetAggregationsConfig().GetMemoryAggregationWindowLength()
 }
 
 func (a *AggregateContainerState) isEmpty() bool {
 	return a.TotalSamplesCount == 0
 }
 
-// UpdateFromPolicy updates container state scaling mode based on resource
+// UpdateFromPolicy updates container state scaling mode and controlled resources based on resource
 // policy of the VPA object.
 func (a *AggregateContainerState) UpdateFromPolicy(resourcePolicy *vpa_types.ContainerResourcePolicy) {
 	// ContainerScalingModeAuto is the default scaling mode
@@ -263,6 +281,10 @@ func (a *AggregateContainerState) UpdateFromPolicy(resourcePolicy *vpa_types.Con
 	a.ScalingMode = &scalingModeAuto
 	if resourcePolicy != nil && resourcePolicy.Mode != nil {
 		a.ScalingMode = resourcePolicy.Mode
+	}
+	a.ControlledResources = &DefaultControlledResources
+	if resourcePolicy != nil && resourcePolicy.ControlledResources != nil {
+		a.ControlledResources = ResourceNamesApiToModel(*resourcePolicy.ControlledResources)
 	}
 }
 
