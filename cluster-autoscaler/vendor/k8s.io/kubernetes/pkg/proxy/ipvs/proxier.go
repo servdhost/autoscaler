@@ -262,9 +262,10 @@ type Proxier struct {
 	gracefuldeleteManager *GracefulTerminationManager
 }
 
-// IPGetter helps get node network interface IP
+// IPGetter helps get node network interface IP and IPs binded to the IPVS dummy interface
 type IPGetter interface {
 	NodeIPs() ([]net.IP, error)
+	BindedIPs() (sets.String, error)
 }
 
 // realIPGetter is a real NodeIP handler, it implements IPGetter.
@@ -298,6 +299,11 @@ func (r *realIPGetter) NodeIPs() (ips []net.IP, err error) {
 		ips = append(ips, net.ParseIP(ipStr))
 	}
 	return ips, nil
+}
+
+// BindedIPs returns all addresses that are binded to the IPVS dummy interface kube-ipvs0
+func (r *realIPGetter) BindedIPs() (sets.String, error) {
+	return r.nl.GetLocalAddresses(DefaultDummyDevice, "")
 }
 
 // Proxier implements proxy.Provider
@@ -441,9 +447,9 @@ func NewProxier(ipt utiliptables.Interface,
 	proxier := &Proxier{
 		portsMap:              make(map[utilproxy.LocalPort]utilproxy.Closeable),
 		serviceMap:            make(proxy.ServiceMap),
-		serviceChanges:        proxy.NewServiceChangeTracker(newServiceInfo, &isIPv6, recorder),
+		serviceChanges:        proxy.NewServiceChangeTracker(newServiceInfo, &isIPv6, recorder, nil),
 		endpointsMap:          make(proxy.EndpointsMap),
-		endpointsChanges:      proxy.NewEndpointChangeTracker(hostname, nil, &isIPv6, recorder, endpointSlicesEnabled),
+		endpointsChanges:      proxy.NewEndpointChangeTracker(hostname, nil, &isIPv6, recorder, endpointSlicesEnabled, nil),
 		syncPeriod:            syncPeriod,
 		minSyncPeriod:         minSyncPeriod,
 		excludeCIDRs:          parseExcludedCIDRs(excludeCIDRs),
@@ -1089,6 +1095,11 @@ func (proxier *Proxier) syncProxyRules() {
 	// activeBindAddrs represents ip address successfully bind to DefaultDummyDevice in this round of sync
 	activeBindAddrs := map[string]bool{}
 
+	bindedAddresses, err := proxier.ipGetter.BindedIPs()
+	if err != nil {
+		klog.Errorf("error listing addresses binded to dummy interface, error: %v", err)
+	}
+
 	hasNodePort := false
 	for _, svc := range proxier.serviceMap {
 		svcInfo, ok := svc.(*serviceInfo)
@@ -1197,7 +1208,7 @@ func (proxier *Proxier) syncProxyRules() {
 			serv.Timeout = uint32(svcInfo.StickyMaxAgeSeconds())
 		}
 		// We need to bind ClusterIP to dummy interface, so set `bindAddr` parameter to `true` in syncService()
-		if err := proxier.syncService(svcNameString, serv, true); err == nil {
+		if err := proxier.syncService(svcNameString, serv, true, bindedAddresses); err == nil {
 			activeIPVSServices[serv.String()] = true
 			activeBindAddrs[serv.Address.String()] = true
 			// ExternalTrafficPolicy only works for NodePort and external LB traffic, does not affect ClusterIP
@@ -1252,7 +1263,7 @@ func (proxier *Proxier) syncProxyRules() {
 				SetType:  utilipset.HashIPPort,
 			}
 
-			if utilfeature.DefaultFeatureGate.Enabled(features.ExternalPolicyForExternalIP) && svcInfo.OnlyNodeLocalEndpoints() {
+			if svcInfo.OnlyNodeLocalEndpoints() {
 				if valid := proxier.ipsetList[kubeExternalIPLocalSet].validateEntry(entry); !valid {
 					klog.Errorf("%s", fmt.Sprintf(EntryInvalidErr, entry, proxier.ipsetList[kubeExternalIPLocalSet].Name))
 					continue
@@ -1278,14 +1289,11 @@ func (proxier *Proxier) syncProxyRules() {
 				serv.Flags |= utilipvs.FlagPersistent
 				serv.Timeout = uint32(svcInfo.StickyMaxAgeSeconds())
 			}
-			if err := proxier.syncService(svcNameString, serv, true); err == nil {
+			if err := proxier.syncService(svcNameString, serv, true, bindedAddresses); err == nil {
 				activeIPVSServices[serv.String()] = true
 				activeBindAddrs[serv.Address.String()] = true
 
-				onlyNodeLocalEndpoints := false
-				if utilfeature.DefaultFeatureGate.Enabled(features.ExternalPolicyForExternalIP) {
-					onlyNodeLocalEndpoints = svcInfo.OnlyNodeLocalEndpoints()
-				}
+				onlyNodeLocalEndpoints := svcInfo.OnlyNodeLocalEndpoints()
 				if err := proxier.syncEndpoint(svcName, onlyNodeLocalEndpoints, serv); err != nil {
 					klog.Errorf("Failed to sync endpoint for service: %v, err: %v", serv, err)
 				}
@@ -1384,7 +1392,7 @@ func (proxier *Proxier) syncProxyRules() {
 					serv.Flags |= utilipvs.FlagPersistent
 					serv.Timeout = uint32(svcInfo.StickyMaxAgeSeconds())
 				}
-				if err := proxier.syncService(svcNameString, serv, true); err == nil {
+				if err := proxier.syncService(svcNameString, serv, true, bindedAddresses); err == nil {
 					activeIPVSServices[serv.String()] = true
 					activeBindAddrs[serv.Address.String()] = true
 					if err := proxier.syncEndpoint(svcName, svcInfo.OnlyNodeLocalEndpoints(), serv); err != nil {
@@ -1541,7 +1549,7 @@ func (proxier *Proxier) syncProxyRules() {
 					serv.Timeout = uint32(svcInfo.StickyMaxAgeSeconds())
 				}
 				// There is no need to bind Node IP to dummy interface, so set parameter `bindAddr` to `false`.
-				if err := proxier.syncService(svcNameString, serv, false); err == nil {
+				if err := proxier.syncService(svcNameString, serv, false, bindedAddresses); err == nil {
 					activeIPVSServices[serv.String()] = true
 					if err := proxier.syncEndpoint(svcName, svcInfo.OnlyNodeLocalEndpoints(), serv); err != nil {
 						klog.Errorf("Failed to sync endpoint for service: %v, err: %v", serv, err)
@@ -1787,6 +1795,39 @@ func (proxier *Proxier) writeIptablesRules() {
 		"-j", "ACCEPT",
 	)
 
+	// Install the kubernetes-specific postrouting rules. We use a whole chain for
+	// this so that it is easier to flush and change, for example if the mark
+	// value should ever change.
+	// NB: THIS MUST MATCH the corresponding code in the kubelet
+	writeLine(proxier.natRules, []string{
+		"-A", string(kubePostroutingChain),
+		"-m", "mark", "!", "--mark", fmt.Sprintf("%s/%s", proxier.masqueradeMark, proxier.masqueradeMark),
+		"-j", "RETURN",
+	}...)
+	// Clear the mark to avoid re-masquerading if the packet re-traverses the network stack.
+	writeLine(proxier.natRules, []string{
+		"-A", string(kubePostroutingChain),
+		// XOR proxier.masqueradeMark to unset it
+		"-j", "MARK", "--xor-mark", proxier.masqueradeMark,
+	}...)
+	masqRule := []string{
+		"-A", string(kubePostroutingChain),
+		"-m", "comment", "--comment", `"kubernetes service traffic requiring SNAT"`,
+		"-j", "MASQUERADE",
+	}
+	if proxier.iptables.HasRandomFully() {
+		masqRule = append(masqRule, "--random-fully")
+	}
+	writeLine(proxier.natRules, masqRule...)
+
+	// Install the kubernetes-specific masquerade mark rule. We use a whole chain for
+	// this so that it is easier to flush and change, for example if the mark
+	// value should ever change.
+	writeLine(proxier.natRules, []string{
+		"-A", string(KubeMarkMasqChain),
+		"-j", "MARK", "--or-mark", proxier.masqueradeMark,
+	}...)
+
 	// Write the end-of-table markers.
 	writeLine(proxier.filterRules, "COMMIT")
 	writeLine(proxier.natRules, "COMMIT")
@@ -1845,38 +1886,6 @@ func (proxier *Proxier) createAndLinkeKubeChain() {
 		}
 	}
 
-	// Install the kubernetes-specific postrouting rules. We use a whole chain for
-	// this so that it is easier to flush and change, for example if the mark
-	// value should ever change.
-	// NB: THIS MUST MATCH the corresponding code in the kubelet
-	writeLine(proxier.natRules, []string{
-		"-A", string(kubePostroutingChain),
-		"-m", "mark", "!", "--mark", fmt.Sprintf("%s/%s", proxier.masqueradeMark, proxier.masqueradeMark),
-		"-j", "RETURN",
-	}...)
-	// Clear the mark to avoid re-masquerading if the packet re-traverses the network stack.
-	writeLine(proxier.natRules, []string{
-		"-A", string(kubePostroutingChain),
-		// XOR proxier.masqueradeMark to unset it
-		"-j", "MARK", "--xor-mark", proxier.masqueradeMark,
-	}...)
-	masqRule := []string{
-		"-A", string(kubePostroutingChain),
-		"-m", "comment", "--comment", `"kubernetes service traffic requiring SNAT"`,
-		"-j", "MASQUERADE",
-	}
-	if proxier.iptables.HasRandomFully() {
-		masqRule = append(masqRule, "--random-fully")
-	}
-	writeLine(proxier.natRules, masqRule...)
-
-	// Install the kubernetes-specific masquerade mark rule. We use a whole chain for
-	// this so that it is easier to flush and change, for example if the mark
-	// value should ever change.
-	writeLine(proxier.natRules, []string{
-		"-A", string(KubeMarkMasqChain),
-		"-j", "MARK", "--or-mark", proxier.masqueradeMark,
-	}...)
 }
 
 // getExistingChains get iptables-save output so we can check for existing chains and rules.
@@ -1921,7 +1930,7 @@ func (proxier *Proxier) deleteEndpointConnections(connectionMap []proxy.ServiceE
 	}
 }
 
-func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, bindAddr bool) error {
+func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, bindAddr bool, bindedAddresses sets.String) error {
 	appliedVirtualServer, _ := proxier.ipvs.GetVirtualServer(vs)
 	if appliedVirtualServer == nil || !appliedVirtualServer.Equal(vs) {
 		if appliedVirtualServer == nil {
@@ -1942,9 +1951,14 @@ func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, 
 		}
 	}
 
-	// bind service address to dummy interface even if service not changed,
-	// in case that service IP was removed by other processes
+	// bind service address to dummy interface
 	if bindAddr {
+		// always attempt to bind if bindedAddresses is nil,
+		// otherwise check if it's already binded and return early
+		if bindedAddresses != nil && bindedAddresses.Has(vs.Address.String()) {
+			return nil
+		}
+
 		klog.V(4).Infof("Bind addr %s", vs.Address.String())
 		_, err := proxier.netlinkHandle.EnsureAddressBind(vs.Address.String(), DefaultDummyDevice)
 		if err != nil {
@@ -1952,6 +1966,7 @@ func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, 
 			return err
 		}
 	}
+
 	return nil
 }
 

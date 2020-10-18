@@ -42,20 +42,20 @@ const (
 	// Filter is the name of the filter extension point.
 	Filter = "Filter"
 	// Specifies the maximum timeout a permit plugin can return.
-	maxTimeout                  time.Duration = 15 * time.Minute
-	preFilter                                 = "PreFilter"
-	preFilterExtensionAddPod                  = "PreFilterExtensionAddPod"
-	preFilterExtensionRemovePod               = "PreFilterExtensionRemovePod"
-	postFilter                                = "PostFilter"
-	preScore                                  = "PreScore"
-	score                                     = "Score"
-	scoreExtensionNormalize                   = "ScoreExtensionNormalize"
-	preBind                                   = "PreBind"
-	bind                                      = "Bind"
-	postBind                                  = "PostBind"
-	reserve                                   = "Reserve"
-	unreserve                                 = "Unreserve"
-	permit                                    = "Permit"
+	maxTimeout                  = 15 * time.Minute
+	preFilter                   = "PreFilter"
+	preFilterExtensionAddPod    = "PreFilterExtensionAddPod"
+	preFilterExtensionRemovePod = "PreFilterExtensionRemovePod"
+	postFilter                  = "PostFilter"
+	preScore                    = "PreScore"
+	score                       = "Score"
+	scoreExtensionNormalize     = "ScoreExtensionNormalize"
+	preBind                     = "PreBind"
+	bind                        = "Bind"
+	postBind                    = "PostBind"
+	reserve                     = "Reserve"
+	unreserve                   = "Unreserve"
+	permit                      = "Permit"
 )
 
 var configDecoder = scheme.Codecs.UniversalDecoder()
@@ -395,11 +395,9 @@ func (f *frameworkImpl) RunPreFilterPlugins(ctx context.Context, state *framewor
 		status = f.runPreFilterPlugin(ctx, pl, state, pod)
 		if !status.IsSuccess() {
 			if status.IsUnschedulable() {
-				msg := fmt.Sprintf("rejected by %q at prefilter: %v", pl.Name(), status.Message())
-				klog.V(4).Infof(msg)
-				return framework.NewStatus(status.Code(), msg)
+				return status
 			}
-			msg := fmt.Sprintf("error while running %q prefilter plugin for pod %q: %v", pl.Name(), pod.Name, status.Message())
+			msg := fmt.Sprintf("prefilter plugin %q failed for pod %q: %v", pl.Name(), pod.Name, status.Message())
 			klog.Error(msg)
 			return framework.NewStatus(framework.Error, msg)
 		}
@@ -625,7 +623,7 @@ func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.Cy
 			}
 			pluginToNodeScores[pl.Name()][index] = framework.NodeScore{
 				Name:  nodeName,
-				Score: int64(s),
+				Score: s,
 			}
 		}
 	})
@@ -664,7 +662,7 @@ func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.Cy
 
 		for i, nodeScore := range nodeScoreList {
 			// return error if score plugin returns invalid score.
-			if nodeScore.Score > int64(framework.MaxNodeScore) || nodeScore.Score < int64(framework.MinNodeScore) {
+			if nodeScore.Score > framework.MaxNodeScore || nodeScore.Score < framework.MinNodeScore {
 				err := fmt.Errorf("score plugin %q returns an invalid score %v, it should in the range of [%v, %v] after normalizing", pl.Name(), nodeScore.Score, framework.MinNodeScore, framework.MaxNodeScore)
 				errCh.SendErrorWithCancel(err, cancel)
 				return
@@ -712,9 +710,9 @@ func (f *frameworkImpl) RunPreBindPlugins(ctx context.Context, state *framework.
 	for _, pl := range f.preBindPlugins {
 		status = f.runPreBindPlugin(ctx, pl, state, pod, nodeName)
 		if !status.IsSuccess() {
-			msg := fmt.Sprintf("error while running %q prebind plugin for pod %q: %v", pl.Name(), pod.Name, status.Message())
-			klog.Error(msg)
-			return framework.NewStatus(framework.Error, msg)
+			err := fmt.Errorf("error while running %q prebind plugin for pod %q: %w", pl.Name(), pod.Name, status.AsError())
+			klog.Error(err)
+			return framework.AsStatus(err)
 		}
 	}
 	return nil
@@ -745,9 +743,9 @@ func (f *frameworkImpl) RunBindPlugins(ctx context.Context, state *framework.Cyc
 			continue
 		}
 		if !status.IsSuccess() {
-			msg := fmt.Sprintf("plugin %q failed to bind pod \"%v/%v\": %v", bp.Name(), pod.Namespace, pod.Name, status.Message())
-			klog.Error(msg)
-			return framework.NewStatus(framework.Error, msg)
+			err := fmt.Errorf("plugin %q failed to bind pod \"%v/%v\": %w", bp.Name(), pod.Namespace, pod.Name, status.AsError())
+			klog.Error(err)
+			return framework.AsStatus(err)
 		}
 		return status
 	}

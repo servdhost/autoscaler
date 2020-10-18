@@ -21,9 +21,10 @@ K8S_REV="master"
 BATCH_MODE="false"
 TARGET_MODULE=${TARGET_MODULE:-k8s.io/autoscaler/cluster-autoscaler}
 VERIFY_COMMAND=${VERIFY_COMMAND:-"go test -mod=vendor ./..."}
+OVERRIDE_GO_VERSION="false"
 
 ARGS="$@"
-OPTS=`getopt -o f::r::d::v::b:: --long k8sfork::,k8srev::,workdir::,batch:: -n $SCRIPT_NAME -- "$@"`
+OPTS=`getopt -o f::r::d::v::b::o:: --long k8sfork::,k8srev::,workdir::,batch::,override-go-version:: -n $SCRIPT_NAME -- "$@"`
 if [ $? != 0 ] ; then echo "Failed parsing options." >&2 ; exit 1 ; fi
 eval set -- "$OPTS"
 while true; do
@@ -32,6 +33,7 @@ while true; do
     -r | --k8srev ) K8S_REV="$2"; shift; shift ;;
     -d | --workdir ) WORK_DIR="$2"; shift; shift ;;
     -b | --batch ) BATCH_MODE="true"; shift; shift ;;
+    -o | --override-go-version) OVERRIDE_GO_VERSION="true"; shift; shift ;;
     -v ) VERBOSE=1; shift; if [[ "$1" == "v" ]]; then VERBOSE=2; shift; fi; ;;
     -- ) shift; break ;;
     * ) break ;;
@@ -78,12 +80,13 @@ set +o errexit
 
   if [ ! -d ${K8S_REPO} ]; then
     echo "Cloning ${K8S_FORK} into ${K8S_REPO}"
-    git clone ${K8S_FORK} ${K8S_REPO} >&${BASH_XTRACEFD} 2>&1
+    git clone --depth 1 ${K8S_FORK} ${K8S_REPO} >&${BASH_XTRACEFD} 2>&1
   fi
 
   pushd ${K8S_REPO} >/dev/null
-  git checkout ${K8S_REV} >&${BASH_XTRACEFD} 2>&1
-  K8S_REV_PARSED=$(git rev-parse ${K8S_REV})
+  git fetch --depth 1 origin ${K8S_REV} >&${BASH_XTRACEFD} 2>&1
+  git checkout FETCH_HEAD >&${BASH_XTRACEFD} 2>&1
+  K8S_REV_PARSED=$(git rev-parse FETCH_HEAD)
   popd >/dev/null
 
 
@@ -109,8 +112,13 @@ set +o errexit
   REQUIRED_GO_VERSION=$(cat go.mod  |grep '^go ' |tr -s ' ' |cut -d ' '  -f 2)
   USED_GO_VERSION=$(go version |sed 's/.*go\([0-9]\+\.[0-9]\+\).*/\1/')
 
+
   if [[ "${REQUIRED_GO_VERSION}" != "${USED_GO_VERSION}" ]];then
-    err_rerun "Invalid go version ${USED_GO_VERSION}; required go version is ${REQUIRED_GO_VERSION}."
+    if [[ "${OVERRIDE_GO_VERSION}" == "false" ]]; then
+      err_rerun "Invalid go version ${USED_GO_VERSION}; required go version is ${REQUIRED_GO_VERSION}."
+    else
+      echo "Overriding go version found in go.mod file. Expected go version ${REQUIRED_GO_VERSION}, using ${USED_GO_VERSION}"
+    fi
   fi
 
   # Fix module name and staging modules links

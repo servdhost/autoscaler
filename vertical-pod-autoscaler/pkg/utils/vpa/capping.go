@@ -109,6 +109,7 @@ func getCappedRecommendationForContainer(
 	}
 	// containerPolicy can be nil (user does not have to configure it).
 	containerPolicy := GetContainerResourcePolicy(container.Name, policy)
+	containerControlledValues := GetContainerControlledValues(container.Name, policy)
 
 	cappedRecommendations := containerRecommendation.DeepCopy()
 
@@ -123,9 +124,11 @@ func getCappedRecommendationForContainer(
 			cappingAnnotations = append(cappingAnnotations, annotations...)
 		}
 		// TODO: If limits and policy are conflicting, set some condition on the VPA.
-		annotations = capRecommendationToContainerLimit(recommendation, container)
-		if genAnnotations {
-			cappingAnnotations = append(cappingAnnotations, annotations...)
+		if containerControlledValues == vpa_types.ContainerControlledValuesRequestsOnly {
+			annotations = capRecommendationToContainerLimit(recommendation, container)
+			if genAnnotations {
+				cappingAnnotations = append(cappingAnnotations, annotations...)
+			}
 		}
 	}
 
@@ -332,11 +335,11 @@ func getBoundaryRecommendation(recommendation apiv1.ResourceList, container apiv
 	if boundaryLimit == nil {
 		return apiv1.ResourceList{}
 	}
-	cpuMaxRequest := GetBoundaryRequest(container.Resources.Requests.Cpu(), container.Resources.Limits.Cpu(), boundaryLimit.Cpu(), defaultLimit.Cpu())
-	memMaxRequest := GetBoundaryRequest(container.Resources.Requests.Memory(), container.Resources.Limits.Memory(), boundaryLimit.Memory(), defaultLimit.Memory())
+	boundaryCpu := GetBoundaryRequest(container.Resources.Requests.Cpu(), container.Resources.Limits.Cpu(), boundaryLimit.Cpu(), defaultLimit.Cpu())
+	boundaryMem := GetBoundaryRequest(container.Resources.Requests.Memory(), container.Resources.Limits.Memory(), boundaryLimit.Memory(), defaultLimit.Memory())
 	return apiv1.ResourceList{
-		apiv1.ResourceCPU:    *cpuMaxRequest,
-		apiv1.ResourceMemory: *memMaxRequest,
+		apiv1.ResourceCPU:    *boundaryCpu,
+		apiv1.ResourceMemory: *boundaryMem,
 	}
 }
 
@@ -368,7 +371,12 @@ func applyPodLimitRange(resources []vpa_types.RecommendedContainerResources,
 	if minLimit.Cmp(sumRecommendation) > 0 && !sumLimit.IsZero() {
 		for i := range pod.Spec.Containers {
 			request := (*fieldGetter(resources[i]))[resourceName]
-			cappedContainerRequest, _ := scaleQuantityProportionally(&request, &sumRecommendation, &minLimit)
+			var cappedContainerRequest *resource.Quantity
+			if resourceName == apiv1.ResourceMemory {
+				cappedContainerRequest, _ = scaleQuantityProportionally(&request, &sumRecommendation, &minLimit, roundUpToFullUnit)
+			} else {
+				cappedContainerRequest, _ = scaleQuantityProportionally(&request, &sumRecommendation, &minLimit, noRounding)
+			}
 			(*fieldGetter(resources[i]))[resourceName] = *cappedContainerRequest
 		}
 		return resources
@@ -387,7 +395,12 @@ func applyPodLimitRange(resources []vpa_types.RecommendedContainerResources,
 	}
 	for i := range pod.Spec.Containers {
 		limit := (*fieldGetter(resources[i]))[resourceName]
-		cappedContainerRequest, _ := scaleQuantityProportionally(&limit, &sumLimit, &targetTotalLimit)
+		var cappedContainerRequest *resource.Quantity
+		if resourceName == apiv1.ResourceMemory {
+			cappedContainerRequest, _ = scaleQuantityProportionally(&limit, &sumLimit, &targetTotalLimit, roundDownToFullUnit)
+		} else {
+			cappedContainerRequest, _ = scaleQuantityProportionally(&limit, &sumLimit, &targetTotalLimit, noRounding)
+		}
 		(*fieldGetter(resources[i]))[resourceName] = *cappedContainerRequest
 	}
 	return resources

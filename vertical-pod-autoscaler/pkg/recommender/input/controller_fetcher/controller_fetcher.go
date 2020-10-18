@@ -17,6 +17,7 @@ limitations under the License.
 package controllerfetcher
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -44,13 +45,14 @@ import (
 type wellKnownController string
 
 const (
+	cronJob               wellKnownController = "CronJob"
 	daemonSet             wellKnownController = "DaemonSet"
 	deployment            wellKnownController = "Deployment"
-	replicaSet            wellKnownController = "ReplicaSet"
-	statefulSet           wellKnownController = "StatefulSet"
-	replicationController wellKnownController = "ReplicationController"
+	node                  wellKnownController = "Node"
 	job                   wellKnownController = "Job"
-	cronJob               wellKnownController = "CronJob"
+	replicaSet            wellKnownController = "ReplicaSet"
+	replicationController wellKnownController = "ReplicationController"
+	statefulSet           wellKnownController = "StatefulSet"
 )
 
 const (
@@ -250,6 +252,9 @@ func (f *controllerFetcher) isWellKnownOrScalable(key *ControllerKeyWithAPIVersi
 	if f.isWellKnown(key) {
 		return true
 	}
+	if gk, err := key.groupKind(); err != nil && wellKnownController(gk.Kind) == node {
+		return false
+	}
 
 	//if not well known check if it supports scaling
 	groupKind, err := key.groupKind()
@@ -266,7 +271,7 @@ func (f *controllerFetcher) isWellKnownOrScalable(key *ControllerKeyWithAPIVersi
 
 	for _, mapping := range mappings {
 		groupResource := mapping.Resource.GroupResource()
-		scale, err := f.scaleNamespacer.Scales(key.Namespace).Get(groupResource, key.Name)
+		scale, err := f.scaleNamespacer.Scales(key.Namespace).Get(context.TODO(), groupResource, key.Name, metav1.GetOptions{})
 		if err == nil && scale != nil {
 			return true
 		}
@@ -275,15 +280,20 @@ func (f *controllerFetcher) isWellKnownOrScalable(key *ControllerKeyWithAPIVersi
 }
 
 func (f *controllerFetcher) getOwnerForScaleResource(groupKind schema.GroupKind, namespace, name string) (*ControllerKeyWithAPIVersion, error) {
+	if wellKnownController(groupKind.Kind) == node {
+		// Some pods specify nods as their owners. This causes performance problems
+		// in big clusters when VPA tries to get all nodes. We know nodes aren't
+		// valid controllers so we can skip trying to fetch them.
+		return nil, fmt.Errorf("node is not a valid owner")
+	}
 	mappings, err := f.mapper.RESTMappings(groupKind)
 	if err != nil {
 		return nil, err
 	}
-
 	var lastError error
 	for _, mapping := range mappings {
 		groupResource := mapping.Resource.GroupResource()
-		scale, err := f.scaleNamespacer.Scales(namespace).Get(groupResource, name)
+		scale, err := f.scaleNamespacer.Scales(namespace).Get(context.TODO(), groupResource, name, metav1.GetOptions{})
 		if err == nil {
 			return getOwnerController(scale.OwnerReferences, namespace), nil
 		}

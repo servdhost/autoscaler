@@ -1,4 +1,4 @@
-// +build !gce,!aws,!azure,!kubemark,!alicloud,!magnum,!digitalocean,!clusterapi
+// +build !gce,!aws,!azure,!kubemark,!alicloud,!magnum,!digitalocean,!clusterapi,!huaweicloud
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -26,7 +26,9 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/baiducloud"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/clusterapi"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/digitalocean"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/exoscale"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/gce"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/magnum"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/packet"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
@@ -41,6 +43,8 @@ var AvailableCloudProviders = []string{
 	cloudprovider.BaiducloudProviderName,
 	cloudprovider.MagnumProviderName,
 	cloudprovider.DigitalOceanProviderName,
+	cloudprovider.ExoscaleProviderName,
+	cloudprovider.HuaweicloudProviderName,
 	clusterapi.ProviderName,
 }
 
@@ -61,8 +65,12 @@ func buildCloudProvider(opts config.AutoscalingOptions, do cloudprovider.NodeGro
 		return baiducloud.BuildBaiducloud(opts, do, rl)
 	case cloudprovider.DigitalOceanProviderName:
 		return digitalocean.BuildDigitalOcean(opts, do, rl)
+	case cloudprovider.ExoscaleProviderName:
+		return exoscale.BuildExoscale(opts, do, rl)
 	case cloudprovider.MagnumProviderName:
 		return magnum.BuildMagnum(opts, do, rl)
+	case cloudprovider.HuaweicloudProviderName:
+		return huaweicloud.BuildHuaweiCloud(opts, do, rl)
 	case packet.ProviderName:
 		return packet.BuildPacket(opts, do, rl)
 	case clusterapi.ProviderName:

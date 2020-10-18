@@ -31,6 +31,8 @@ import (
 const (
 	// ErrReasonConstraintsNotMatch is used for PodTopologySpread filter error.
 	ErrReasonConstraintsNotMatch = "node(s) didn't match pod topology spread constraints"
+	// ErrReasonNodeLabelNotMatch is used when the node doesn't hold the required label.
+	ErrReasonNodeLabelNotMatch = ErrReasonConstraintsNotMatch + " (missing required label)"
 )
 
 // PodTopologySpread is a plugin that ensures pod's topologySpreadConstraints is satisfied.
@@ -56,11 +58,6 @@ const (
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *PodTopologySpread) Name() string {
 	return Name
-}
-
-// BuildArgs returns the arguments used to build the plugin.
-func (pl *PodTopologySpread) BuildArgs() interface{} {
-	return pl.args
 }
 
 // New initializes a new plugin and returns it.

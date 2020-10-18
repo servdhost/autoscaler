@@ -37,12 +37,16 @@ const (
 	BaiducloudProviderName = "baiducloud"
 	// DigitalOceanProviderName gets the provider name of digitalocean
 	DigitalOceanProviderName = "digitalocean"
+	// ExoscaleProviderName gets the provider name of exoscale
+	ExoscaleProviderName = "exoscale"
 	// GceProviderName gets the provider name of gce
 	GceProviderName = "gce"
 	// MagnumProviderName gets the provider name of magnum
 	MagnumProviderName = "magnum"
 	// KubemarkProviderName gets the provider name of kubemark
 	KubemarkProviderName = "kubemark"
+	// HuaweicloudProviderName gets the provider name of huaweicloud
+	HuaweicloudProviderName = "huaweicloud"
 )
 
 // CloudProvider contains configuration info and functions for interacting with
