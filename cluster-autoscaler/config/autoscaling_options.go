@@ -140,9 +140,15 @@ type AutoscalingOptions struct {
 	BalancingExtraIgnoredLabels []string
 	// AWSUseStaticInstanceList tells if AWS cloud provider use static instance type list or dynamically fetch from remote APIs.
 	AWSUseStaticInstanceList bool
+	// ConcurrentGceRefreshes is the maximum number of concurrently refreshed instance groups or instance templates.
+	ConcurrentGceRefreshes int
 	// Path to kube configuration if available
 	KubeConfigPath string
 	// ClusterAPICloudConfigAuthoritative tells the Cluster API provider to treat the CloudConfig option as authoritative and
 	// not use KubeConfigPath as a fallback when it is not provided.
 	ClusterAPICloudConfigAuthoritative bool
+	// Enable or disable cordon nodes functionality before terminating the node during downscale process
+	CordonNodeBeforeTerminate bool
+	// DaemonSetEvictionForEmptyNodes is whether CA will gracefully terminate DaemonSet pods from empty nodes.
+	DaemonSetEvictionForEmptyNodes bool
 }
