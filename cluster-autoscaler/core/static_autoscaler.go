@@ -24,7 +24,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
@@ -57,6 +57,9 @@ const (
 	unschedulablePodWithGpuTimeBuffer = 30 * time.Second
 	// How long should Cluster Autoscaler wait for nodes to become ready after start.
 	nodesNotReadyAfterStartTimeout = 10 * time.Minute
+
+	// NodeUpcomingAnnotation is an annotation CA adds to nodes which are upcoming.
+	NodeUpcomingAnnotation = "cluster-autoscaler.k8s.io/upcoming-node"
 )
 
 // StaticAutoscaler is an autoscaler which has all the core functionality of a CA but without the reconfiguration feature
@@ -179,7 +182,7 @@ func (a *StaticAutoscaler) cleanUpIfRequired() {
 		klog.Errorf("Failed to list ready nodes, not cleaning up taints: %v", err)
 	} else {
 		deletetaint.CleanAllToBeDeleted(readyNodes,
-			a.AutoscalingContext.ClientSet, a.Recorder)
+			a.AutoscalingContext.ClientSet, a.Recorder, a.CordonNodeBeforeTerminate)
 		if a.AutoscalingContext.AutoscalingOptions.MaxBulkSoftTaintCount == 0 {
 			// Clean old taints if soft taints handling is disabled
 			deletetaint.CleanAllDeletionCandidates(readyNodes,
@@ -526,7 +529,7 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) errors.AutoscalerError
 
 			scaleDownStatus.RemovedNodeGroups = removedNodeGroups
 
-			if scaleDownStatus.Result == status.ScaleDownNodeDeleted {
+			if scaleDownStatus.Result == status.ScaleDownNodeDeleteStarted {
 				a.lastScaleDownDeleteTime = currentTime
 				a.clusterStateRegistry.Recalculate()
 			}
@@ -795,6 +798,12 @@ func getUpcomingNodeInfos(registry *clusterstate.ClusterStateRegistry, nodeInfos
 			klog.Warningf("Couldn't find template for node group %s", nodeGroup)
 			continue
 		}
+
+		if nodeTemplate.Node().Annotations == nil {
+			nodeTemplate.Node().Annotations = make(map[string]string)
+		}
+		nodeTemplate.Node().Annotations[NodeUpcomingAnnotation] = "true"
+
 		for i := 0; i < numberOfNodes; i++ {
 			// Ensure new nodes have different names because nodeName
 			// will be used as a map key. Also deep copy pods (daemonsets &

@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"unicode"
 
 	restclient "k8s.io/client-go/rest"
 	clientauth "k8s.io/client-go/tools/auth"
@@ -31,6 +32,11 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/imdario/mergo"
+)
+
+const (
+	// clusterExtensionKey is reserved in the cluster extensions list for exec plugin config.
+	clusterExtensionKey = "client.authentication.k8s.io/exec"
 )
 
 var (
@@ -71,7 +77,7 @@ type PersistAuthProviderConfigForUser func(user string) restclient.AuthProviderC
 
 type promptedCredentials struct {
 	username string
-	password string
+	password string `datapolicy:"password"`
 }
 
 // DirectClientConfig is a ClientConfig interface that is backed by a clientcmdapi.Config, options overrides, and an optional fallbackReader for auth information
@@ -188,7 +194,7 @@ func (config *DirectClientConfig) ClientConfig() (*restclient.Config, error) {
 			authInfoName, _ := config.getAuthInfoName()
 			persister = PersisterForUser(config.configAccess, authInfoName)
 		}
-		userAuthPartialConfig, err := config.getUserIdentificationPartialConfig(configAuthInfo, config.fallbackReader, persister)
+		userAuthPartialConfig, err := config.getUserIdentificationPartialConfig(configAuthInfo, config.fallbackReader, persister, configClusterInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -231,7 +237,7 @@ func getServerIdentificationPartialConfig(configAuthInfo clientcmdapi.AuthInfo, 
 // 2.  configAuthInfo.auth-path (this file can contain information that conflicts with #1, and we want #1 to win the priority)
 // 3.  if there is not enough information to identify the user, load try the ~/.kubernetes_auth file
 // 4.  if there is not enough information to identify the user, prompt if possible
-func (config *DirectClientConfig) getUserIdentificationPartialConfig(configAuthInfo clientcmdapi.AuthInfo, fallbackReader io.Reader, persistAuthConfig restclient.AuthProviderConfigPersister) (*restclient.Config, error) {
+func (config *DirectClientConfig) getUserIdentificationPartialConfig(configAuthInfo clientcmdapi.AuthInfo, fallbackReader io.Reader, persistAuthConfig restclient.AuthProviderConfigPersister, configClusterInfo clientcmdapi.Cluster) (*restclient.Config, error) {
 	mergedConfig := &restclient.Config{}
 
 	// blindly overwrite existing values based on precedence
@@ -269,6 +275,8 @@ func (config *DirectClientConfig) getUserIdentificationPartialConfig(configAuthI
 	}
 	if configAuthInfo.Exec != nil {
 		mergedConfig.ExecProvider = configAuthInfo.Exec
+		mergedConfig.ExecProvider.InstallHint = cleanANSIEscapeCodes(mergedConfig.ExecProvider.InstallHint)
+		mergedConfig.ExecProvider.Config = configClusterInfo.Extensions[clusterExtensionKey]
 	}
 
 	// if there still isn't enough information to authenticate the user, try prompting
@@ -312,6 +320,41 @@ func canIdentifyUser(config restclient.Config) bool {
 		len(config.BearerToken) > 0 ||
 		config.AuthProvider != nil ||
 		config.ExecProvider != nil
+}
+
+// cleanANSIEscapeCodes takes an arbitrary string and ensures that there are no
+// ANSI escape sequences that could put the terminal in a weird state (e.g.,
+// "\e[1m" bolds text)
+func cleanANSIEscapeCodes(s string) string {
+	// spaceControlCharacters includes tab, new line, vertical tab, new page, and
+	// carriage return. These are in the unicode.Cc category, but that category also
+	// contains ESC (U+001B) which we don't want.
+	spaceControlCharacters := unicode.RangeTable{
+		R16: []unicode.Range16{
+			{Lo: 0x0009, Hi: 0x000D, Stride: 1},
+		},
+	}
+
+	// Why not make this deny-only (instead of allow-only)? Because unicode.C
+	// contains newline and tab characters that we want.
+	allowedRanges := []*unicode.RangeTable{
+		unicode.L,
+		unicode.M,
+		unicode.N,
+		unicode.P,
+		unicode.S,
+		unicode.Z,
+		&spaceControlCharacters,
+	}
+	builder := strings.Builder{}
+	for _, roon := range s {
+		if unicode.IsOneOf(allowedRanges, roon) {
+			builder.WriteRune(roon) // returns nil error, per go doc
+		} else {
+			fmt.Fprintf(&builder, "%U", roon)
+		}
+	}
+	return builder.String()
 }
 
 // Namespace implements ClientConfig

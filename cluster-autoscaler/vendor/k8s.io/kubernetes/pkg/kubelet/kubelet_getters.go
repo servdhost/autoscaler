@@ -24,8 +24,9 @@ import (
 	"path/filepath"
 
 	cadvisorapiv1 "github.com/google/cadvisor/info/v1"
+	cadvisorv2 "github.com/google/cadvisor/info/v2"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 	utilpath "k8s.io/utils/path"
 	utilstrings "k8s.io/utils/strings"
 
@@ -261,23 +262,23 @@ func (kl *Kubelet) GetPodCgroupRoot() string {
 	return kl.containerManager.GetPodCgroupRoot()
 }
 
-// GetHostIP returns host IP or nil in case of error.
-func (kl *Kubelet) GetHostIP() (net.IP, error) {
+// GetHostIPs returns host IPs or nil in case of error.
+func (kl *Kubelet) GetHostIPs() ([]net.IP, error) {
 	node, err := kl.GetNode()
 	if err != nil {
 		return nil, fmt.Errorf("cannot get node: %v", err)
 	}
-	return utilnode.GetNodeHostIP(node)
+	return utilnode.GetNodeHostIPs(node)
 }
 
-// getHostIPAnyway attempts to return the host IP from kubelet's nodeInfo, or
+// getHostIPsAnyWay attempts to return the host IPs from kubelet's nodeInfo, or
 // the initialNode.
-func (kl *Kubelet) getHostIPAnyWay() (net.IP, error) {
+func (kl *Kubelet) getHostIPsAnyWay() ([]net.IP, error) {
 	node, err := kl.getNodeAnyWay()
 	if err != nil {
 		return nil, err
 	}
-	return utilnode.GetNodeHostIP(node)
+	return utilnode.GetNodeHostIPs(node)
 }
 
 // GetExtraSupplementalGroupsForPod returns a list of the extra
@@ -369,6 +370,11 @@ func (kl *Kubelet) podVolumeSubpathsDirExists(podUID types.UID) (bool, error) {
 	return true, nil
 }
 
+// GetRequestedContainersInfo returns container info.
+func (kl *Kubelet) GetRequestedContainersInfo(containerName string, options cadvisorv2.RequestOptions) (map[string]*cadvisorapiv1.ContainerInfo, error) {
+	return kl.cadvisor.GetRequestedContainersInfo(containerName, options)
+}
+
 // GetVersionInfo returns information about the version of cAdvisor in use.
 func (kl *Kubelet) GetVersionInfo() (*cadvisorapiv1.VersionInfo, error) {
 	return kl.cadvisor.VersionInfo()
@@ -376,5 +382,13 @@ func (kl *Kubelet) GetVersionInfo() (*cadvisorapiv1.VersionInfo, error) {
 
 // GetCachedMachineInfo assumes that the machine info can't change without a reboot
 func (kl *Kubelet) GetCachedMachineInfo() (*cadvisorapiv1.MachineInfo, error) {
+	kl.machineInfoLock.RLock()
+	defer kl.machineInfoLock.RUnlock()
 	return kl.machineInfo, nil
+}
+
+func (kl *Kubelet) setCachedMachineInfo(info *cadvisorapiv1.MachineInfo) {
+	kl.machineInfoLock.Lock()
+	defer kl.machineInfoLock.Unlock()
+	kl.machineInfo = info
 }

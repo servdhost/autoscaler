@@ -29,15 +29,13 @@ import (
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
-	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	"k8s.io/kubernetes/pkg/scheduler/internal/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
-	"k8s.io/kubernetes/pkg/scheduler/profile"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 	utiltrace "k8s.io/utils/trace"
 )
@@ -95,7 +93,7 @@ func (f *FitError) Error() string {
 // onto machines.
 // TODO: Rename this type.
 type ScheduleAlgorithm interface {
-	Schedule(context.Context, *profile.Profile, *framework.CycleState, *v1.Pod) (scheduleResult ScheduleResult, err error)
+	Schedule(context.Context, framework.Framework, *framework.CycleState, *v1.Pod) (scheduleResult ScheduleResult, err error)
 	// Extenders returns a slice of extender config. This is exposed for
 	// testing.
 	Extenders() []framework.Extender
@@ -116,8 +114,6 @@ type genericScheduler struct {
 	cache                    internalcache.Cache
 	extenders                []framework.Extender
 	nodeInfoSnapshot         *internalcache.Snapshot
-	pvcLister                corelisters.PersistentVolumeClaimLister
-	disablePreemption        bool
 	percentageOfNodesToScore int32
 	nextStartNodeIndex       int
 }
@@ -132,14 +128,9 @@ func (g *genericScheduler) snapshot() error {
 // Schedule tries to schedule the given pod to one of the nodes in the node list.
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError error with reasons.
-func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+func (g *genericScheduler) Schedule(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
 	trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
 	defer trace.LogIfLong(100 * time.Millisecond)
-
-	if err := podPassesBasicChecks(pod, g.pvcLister); err != nil {
-		return result, err
-	}
-	trace.Step("Basic checks done")
 
 	if err := g.snapshot(); err != nil {
 		return result, err
@@ -150,14 +141,13 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
 		return result, ErrNoNodesAvailable
 	}
 
-	startPredicateEvalTime := time.Now()
-	filteredNodes, filteredNodesStatuses, err := g.findNodesThatFitPod(ctx, prof, state, pod)
+	feasibleNodes, filteredNodesStatuses, err := g.findNodesThatFitPod(ctx, fwk, state, pod)
 	if err != nil {
 		return result, err
 	}
 	trace.Step("Computing predicates done")
 
-	if len(filteredNodes) == 0 {
+	if len(feasibleNodes) == 0 {
 		return result, &FitError{
 			Pod:                   pod,
 			NumAllNodes:           g.nodeInfoSnapshot.NumNodes(),
@@ -165,35 +155,27 @@ func (g *genericScheduler) Schedule(ctx context.Context, prof *profile.Profile, 
 		}
 	}
 
-	metrics.DeprecatedSchedulingAlgorithmPredicateEvaluationSecondsDuration.Observe(metrics.SinceInSeconds(startPredicateEvalTime))
-	metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PredicateEvaluation).Observe(metrics.SinceInSeconds(startPredicateEvalTime))
-
-	startPriorityEvalTime := time.Now()
 	// When only one node after predicate, just use it.
-	if len(filteredNodes) == 1 {
-		metrics.DeprecatedSchedulingAlgorithmPriorityEvaluationSecondsDuration.Observe(metrics.SinceInSeconds(startPriorityEvalTime))
+	if len(feasibleNodes) == 1 {
 		return ScheduleResult{
-			SuggestedHost:  filteredNodes[0].Name,
+			SuggestedHost:  feasibleNodes[0].Name,
 			EvaluatedNodes: 1 + len(filteredNodesStatuses),
 			FeasibleNodes:  1,
 		}, nil
 	}
 
-	priorityList, err := g.prioritizeNodes(ctx, prof, state, pod, filteredNodes)
+	priorityList, err := g.prioritizeNodes(ctx, fwk, state, pod, feasibleNodes)
 	if err != nil {
 		return result, err
 	}
-
-	metrics.DeprecatedSchedulingAlgorithmPriorityEvaluationSecondsDuration.Observe(metrics.SinceInSeconds(startPriorityEvalTime))
-	metrics.DeprecatedSchedulingDuration.WithLabelValues(metrics.PriorityEvaluation).Observe(metrics.SinceInSeconds(startPriorityEvalTime))
 
 	host, err := g.selectHost(priorityList)
 	trace.Step("Prioritizing done")
 
 	return ScheduleResult{
 		SuggestedHost:  host,
-		EvaluatedNodes: len(filteredNodes) + len(filteredNodesStatuses),
-		FeasibleNodes:  len(filteredNodes),
+		EvaluatedNodes: len(feasibleNodes) + len(filteredNodesStatuses),
+		FeasibleNodes:  len(feasibleNodes),
 	}, err
 }
 
@@ -252,28 +234,41 @@ func (g *genericScheduler) numFeasibleNodesToFind(numAllNodes int32) (numNodes i
 
 // Filters the nodes to find the ones that fit the pod based on the framework
 // filter plugins and filter extenders.
-func (g *genericScheduler) findNodesThatFitPod(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pod *v1.Pod) ([]*v1.Node, framework.NodeToStatusMap, error) {
-	// Run "prefilter" plugins.
-	s := prof.RunPreFilterPlugins(ctx, state, pod)
-	if !s.IsSuccess() {
-		return nil, nil, s.AsError()
-	}
-
+func (g *genericScheduler) findNodesThatFitPod(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) ([]*v1.Node, framework.NodeToStatusMap, error) {
 	filteredNodesStatuses := make(framework.NodeToStatusMap)
-	filtered, err := g.findNodesThatPassFilters(ctx, prof, state, pod, filteredNodesStatuses)
+
+	// Run "prefilter" plugins.
+	s := fwk.RunPreFilterPlugins(ctx, state, pod)
+	if !s.IsSuccess() {
+		if !s.IsUnschedulable() {
+			return nil, nil, s.AsError()
+		}
+		// All nodes will have the same status. Some non trivial refactoring is
+		// needed to avoid this copy.
+		allNodes, err := g.nodeInfoSnapshot.NodeInfos().List()
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, n := range allNodes {
+			filteredNodesStatuses[n.Node().Name] = s
+		}
+		return nil, filteredNodesStatuses, nil
+	}
+
+	feasibleNodes, err := g.findNodesThatPassFilters(ctx, fwk, state, pod, filteredNodesStatuses)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	filtered, err = g.findNodesThatPassExtenders(pod, filtered, filteredNodesStatuses)
+	feasibleNodes, err = g.findNodesThatPassExtenders(pod, feasibleNodes, filteredNodesStatuses)
 	if err != nil {
 		return nil, nil, err
 	}
-	return filtered, filteredNodesStatuses, nil
+	return feasibleNodes, filteredNodesStatuses, nil
 }
 
 // findNodesThatPassFilters finds the nodes that fit the filter plugins.
-func (g *genericScheduler) findNodesThatPassFilters(ctx context.Context, prof *profile.Profile, state *framework.CycleState, pod *v1.Pod, statuses framework.NodeToStatusMap) ([]*v1.Node, error) {
+func (g *genericScheduler) findNodesThatPassFilters(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod, statuses framework.NodeToStatusMap) ([]*v1.Node, error) {
 	allNodes, err := g.nodeInfoSnapshot.NodeInfos().List()
 	if err != nil {
 		return nil, err
@@ -281,46 +276,46 @@ func (g *genericScheduler) findNodesThatPassFilters(ctx context.Context, prof *p
 
 	numNodesToFind := g.numFeasibleNodesToFind(int32(len(allNodes)))
 
-	// Create filtered list with enough space to avoid growing it
+	// Create feasible list with enough space to avoid growing it
 	// and allow assigning.
-	filtered := make([]*v1.Node, numNodesToFind)
+	feasibleNodes := make([]*v1.Node, numNodesToFind)
 
-	if !prof.HasFilterPlugins() {
+	if !fwk.HasFilterPlugins() {
 		length := len(allNodes)
-		for i := range filtered {
-			filtered[i] = allNodes[(g.nextStartNodeIndex+i)%length].Node()
+		for i := range feasibleNodes {
+			feasibleNodes[i] = allNodes[(g.nextStartNodeIndex+i)%length].Node()
 		}
-		g.nextStartNodeIndex = (g.nextStartNodeIndex + len(filtered)) % length
-		return filtered, nil
+		g.nextStartNodeIndex = (g.nextStartNodeIndex + len(feasibleNodes)) % length
+		return feasibleNodes, nil
 	}
 
 	errCh := parallelize.NewErrorChannel()
 	var statusesLock sync.Mutex
-	var filteredLen int32
+	var feasibleNodesLen int32
 	ctx, cancel := context.WithCancel(ctx)
 	checkNode := func(i int) {
 		// We check the nodes starting from where we left off in the previous scheduling cycle,
 		// this is to make sure all nodes have the same chance of being examined across pods.
 		nodeInfo := allNodes[(g.nextStartNodeIndex+i)%len(allNodes)]
-		fits, status, err := PodPassesFiltersOnNode(ctx, prof.PreemptHandle(), state, pod, nodeInfo)
+		fits, status, err := PodPassesFiltersOnNode(ctx, fwk.PreemptHandle(), state, pod, nodeInfo)
 		if err != nil {
 			errCh.SendErrorWithCancel(err, cancel)
 			return
 		}
 		if fits {
-			length := atomic.AddInt32(&filteredLen, 1)
+			length := atomic.AddInt32(&feasibleNodesLen, 1)
 			if length > numNodesToFind {
 				cancel()
-				atomic.AddInt32(&filteredLen, -1)
+				atomic.AddInt32(&feasibleNodesLen, -1)
 			} else {
-				filtered[length-1] = nodeInfo.Node()
+				feasibleNodes[length-1] = nodeInfo.Node()
 			}
 		} else {
-			statusesLock.Lock()
 			if !status.IsSuccess() {
+				statusesLock.Lock()
 				statuses[nodeInfo.Node().Name] = status
+				statusesLock.Unlock()
 			}
-			statusesLock.Unlock()
 		}
 	}
 
@@ -330,32 +325,32 @@ func (g *genericScheduler) findNodesThatPassFilters(ctx context.Context, prof *p
 		// We record Filter extension point latency here instead of in framework.go because framework.RunFilterPlugins
 		// function is called for each node, whereas we want to have an overall latency for all nodes per scheduling cycle.
 		// Note that this latency also includes latency for `addNominatedPods`, which calls framework.RunPreFilterAddPod.
-		metrics.FrameworkExtensionPointDuration.WithLabelValues(runtime.Filter, statusCode.String(), prof.Name).Observe(metrics.SinceInSeconds(beginCheckNode))
+		metrics.FrameworkExtensionPointDuration.WithLabelValues(runtime.Filter, statusCode.String(), fwk.ProfileName()).Observe(metrics.SinceInSeconds(beginCheckNode))
 	}()
 
 	// Stops searching for more nodes once the configured number of feasible nodes
 	// are found.
 	parallelize.Until(ctx, len(allNodes), checkNode)
-	processedNodes := int(filteredLen) + len(statuses)
+	processedNodes := int(feasibleNodesLen) + len(statuses)
 	g.nextStartNodeIndex = (g.nextStartNodeIndex + processedNodes) % len(allNodes)
 
-	filtered = filtered[:filteredLen]
+	feasibleNodes = feasibleNodes[:feasibleNodesLen]
 	if err := errCh.ReceiveError(); err != nil {
 		statusCode = framework.Error
 		return nil, err
 	}
-	return filtered, nil
+	return feasibleNodes, nil
 }
 
-func (g *genericScheduler) findNodesThatPassExtenders(pod *v1.Pod, filtered []*v1.Node, statuses framework.NodeToStatusMap) ([]*v1.Node, error) {
+func (g *genericScheduler) findNodesThatPassExtenders(pod *v1.Pod, feasibleNodes []*v1.Node, statuses framework.NodeToStatusMap) ([]*v1.Node, error) {
 	for _, extender := range g.extenders {
-		if len(filtered) == 0 {
+		if len(feasibleNodes) == 0 {
 			break
 		}
 		if !extender.IsInterested(pod) {
 			continue
 		}
-		filteredList, failedMap, err := extender.Filter(pod, filtered)
+		feasibleList, failedMap, err := extender.Filter(pod, feasibleNodes)
 		if err != nil {
 			if extender.IsIgnorable() {
 				klog.Warningf("Skipping extender %v as it returned error %v and has ignorable flag set",
@@ -372,9 +367,9 @@ func (g *genericScheduler) findNodesThatPassExtenders(pod *v1.Pod, filtered []*v
 				statuses[failedNodeName].AppendReason(failedMsg)
 			}
 		}
-		filtered = filteredList
+		feasibleNodes = feasibleList
 	}
-	return filtered, nil
+	return feasibleNodes, nil
 }
 
 // addNominatedPods adds pods with equal or greater priority which are nominated
@@ -393,7 +388,7 @@ func addNominatedPods(ctx context.Context, ph framework.PreemptHandle, pod *v1.P
 	stateOut := state.Clone()
 	podsAdded := false
 	for _, p := range nominatedPods {
-		if podutil.GetPodPriority(p) >= podutil.GetPodPriority(pod) && p.UID != pod.UID {
+		if corev1helpers.PodPriority(p) >= corev1helpers.PodPriority(pod) && p.UID != pod.UID {
 			nodeInfoOut.AddPod(p)
 			status := ph.RunPreFilterExtensionAddPod(ctx, stateOut, pod, p, nodeInfoOut)
 			if !status.IsSuccess() {
@@ -474,14 +469,14 @@ func PodPassesFiltersOnNode(
 // All scores are finally combined (added) to get the total weighted scores of all nodes
 func (g *genericScheduler) prioritizeNodes(
 	ctx context.Context,
-	prof *profile.Profile,
+	fwk framework.Framework,
 	state *framework.CycleState,
 	pod *v1.Pod,
 	nodes []*v1.Node,
 ) (framework.NodeScoreList, error) {
 	// If no priority configs are provided, then all nodes will have a score of one.
 	// This is required to generate the priority list in the required format
-	if len(g.extenders) == 0 && !prof.HasScorePlugins() {
+	if len(g.extenders) == 0 && !fwk.HasScorePlugins() {
 		result := make(framework.NodeScoreList, 0, len(nodes))
 		for i := range nodes {
 			result = append(result, framework.NodeScore{
@@ -493,13 +488,13 @@ func (g *genericScheduler) prioritizeNodes(
 	}
 
 	// Run PreScore plugins.
-	preScoreStatus := prof.RunPreScorePlugins(ctx, state, pod, nodes)
+	preScoreStatus := fwk.RunPreScorePlugins(ctx, state, pod, nodes)
 	if !preScoreStatus.IsSuccess() {
 		return nil, preScoreStatus.AsError()
 	}
 
 	// Run the Score plugins.
-	scoresMap, scoreStatus := prof.RunScorePlugins(ctx, state, pod, nodes)
+	scoresMap, scoreStatus := fwk.RunScorePlugins(ctx, state, pod, nodes)
 	if !scoreStatus.IsSuccess() {
 		return nil, scoreStatus.AsError()
 	}
@@ -568,46 +563,16 @@ func (g *genericScheduler) prioritizeNodes(
 	return result, nil
 }
 
-// podPassesBasicChecks makes sanity checks on the pod if it can be scheduled.
-func podPassesBasicChecks(pod *v1.Pod, pvcLister corelisters.PersistentVolumeClaimLister) error {
-	// Check PVCs used by the pod
-	namespace := pod.Namespace
-	manifest := &(pod.Spec)
-	for i := range manifest.Volumes {
-		volume := &manifest.Volumes[i]
-		if volume.PersistentVolumeClaim == nil {
-			// Volume is not a PVC, ignore
-			continue
-		}
-		pvcName := volume.PersistentVolumeClaim.ClaimName
-		pvc, err := pvcLister.PersistentVolumeClaims(namespace).Get(pvcName)
-		if err != nil {
-			// The error has already enough context ("persistentvolumeclaim "myclaim" not found")
-			return err
-		}
-
-		if pvc.DeletionTimestamp != nil {
-			return fmt.Errorf("persistentvolumeclaim %q is being deleted", pvc.Name)
-		}
-	}
-
-	return nil
-}
-
 // NewGenericScheduler creates a genericScheduler object.
 func NewGenericScheduler(
 	cache internalcache.Cache,
 	nodeInfoSnapshot *internalcache.Snapshot,
 	extenders []framework.Extender,
-	pvcLister corelisters.PersistentVolumeClaimLister,
-	disablePreemption bool,
 	percentageOfNodesToScore int32) ScheduleAlgorithm {
 	return &genericScheduler{
 		cache:                    cache,
 		extenders:                extenders,
 		nodeInfoSnapshot:         nodeInfoSnapshot,
-		pvcLister:                pvcLister,
-		disablePreemption:        disablePreemption,
 		percentageOfNodesToScore: percentageOfNodesToScore,
 	}
 }
